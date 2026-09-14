@@ -23,6 +23,21 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 
+def normalize_database_url(url: str) -> str:
+    url = str(url or "").strip().strip('"').strip("'")
+    if not url:
+        return url
+    if url.startswith("postgres://"):
+        url = "postgresql+psycopg2://" + url[len("postgres://") :]
+    elif url.startswith("postgresql+psycopg2://"):
+        pass
+    elif url.startswith("postgresql://"):
+        url = "postgresql+psycopg2://" + url[len("postgresql://") :]
+    if url.startswith("postgresql") and "sslmode=" not in url:
+        url += ("&" if "?" in url else "?") + "sslmode=require"
+    return url
+
+
 def _database_url() -> str:
     url = os.environ.get("DATABASE_URL")
     if not url:
@@ -34,12 +49,15 @@ def _database_url() -> str:
             url = None
     if not url:
         return "sqlite:///dg_inventory.db"
-    url = str(url).strip()
-    if url.startswith("postgres://"):
-        url = "postgresql+psycopg2://" + url[len("postgres://") :]
-    elif url.startswith("postgresql://"):
-        url = "postgresql+psycopg2://" + url[len("postgresql://") :]
-    return url
+    return normalize_database_url(str(url))
+
+
+def running_on_streamlit_cloud() -> bool:
+    return os.path.isdir("/mount/src") or os.environ.get("STREAMLIT_CLOUD") == "1"
+
+
+def using_sqlite() -> bool:
+    return _database_url().startswith("sqlite")
 
 
 def _make_engine() -> Engine:
@@ -47,6 +65,8 @@ def _make_engine() -> Engine:
     kwargs: dict = {"future": True, "pool_pre_ping": True}
     if url.startswith("sqlite"):
         kwargs["connect_args"] = {"check_same_thread": False}
+    else:
+        kwargs["pool_recycle"] = 280
     engine = create_engine(url, **kwargs)
 
     if engine.dialect.name == "sqlite":

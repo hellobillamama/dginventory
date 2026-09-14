@@ -10,7 +10,7 @@ import pandas as pd
 import streamlit as st
 
 from config import KARIGAR_NONE, karigar_select_options, normalize_karigar
-from db import SessionLocal, dialect_name, get_engine
+from db import SessionLocal, dialect_name, get_engine, running_on_streamlit_cloud
 from services import (
     apply_adjustment,
     apply_designer_take,
@@ -180,6 +180,16 @@ with st.sidebar:
     st.metric("Distinct styles", f"{n_styles:,}")
     st.metric("BOM rows", f"{n_bom:,}")
     st.write(f"Database: `{dialect_name()}`")
+    if dialect_name() == "sqlite" and running_on_streamlit_cloud():
+        st.error(
+            "This website is using a temporary empty database. "
+            "Your real data is on the office PC. Set DATABASE_URL (Neon/Supabase) "
+            "in Manage app → Secrets, then copy the PC database once (Setup / Import)."
+        )
+    elif dialect_name() == "sqlite":
+        st.info("This PC stores data in dg_inventory.db. For phones/cloud, migrate to Postgres in Setup / Import.")
+    else:
+        st.success("Persistent Postgres — saved data stays after refresh and sleep.")
     cfg = sheets_config()
     if cfg["configured"]:
         st.success("Google Sheets connected")
@@ -766,6 +776,49 @@ with tabs[7]:
     s1.metric("Distinct styles", f"{n_styles:,}")
     s2.metric("Total BOM rows", f"{n_bom:,}")
 
+    st.markdown("### Persistent database (keep data forever)")
+    st.write(
+        "Streamlit Cloud **sleeps** and its SQLite file is thrown away. "
+        "A Neon or Supabase Postgres URL keeps every BOM, stock, PO, and adjustment. "
+        "The website and this PC then share the **same** database."
+    )
+    st.markdown(
+        """
+1. Create a free database at [Neon](https://console.neon.tech) (recommended) or [Supabase](https://supabase.com).
+2. Copy the connection string (`postgresql://...`).
+3. On Streamlit Cloud: **Manage app → Settings → Secrets** and paste:
+   `DATABASE_URL = "postgresql://..."`
+4. On this PC, paste the same URL below and copy the local `dg_inventory.db` into it **once**.
+"""
+    )
+    pg_url = st.text_input("Postgres DATABASE_URL", type="password", key="persist_db_url")
+    confirm_wipe = st.checkbox(
+        "Overwrite the Postgres database with this PC's SQLite file (one-time copy)",
+        key="persist_db_confirm",
+    )
+    if st.button("Copy office data into Postgres"):
+        if not pg_url.strip():
+            st.error("Paste the Postgres URL first.")
+        elif running_on_streamlit_cloud():
+            st.error("Run this copy from the office PC (where dg_inventory.db lives), not from the website.")
+        elif not confirm_wipe:
+            st.error("Tick the confirmation box. This replaces whatever is currently in Postgres.")
+        else:
+            try:
+                from migrate_db import migrate_sqlite_to_postgres, save_database_url_secret
+
+                save_database_url_secret(pg_url.strip())
+                with st.spinner("Copying BOM, inventory, and history… this can take a minute"):
+                    copied = migrate_sqlite_to_postgres(pg_url.strip())
+                st.success(
+                    "Copied: "
+                    + ", ".join(f"{k}={v:,}" for k, v in copied.items())
+                    + ". Restart this app, and add the same DATABASE_URL to Streamlit Cloud secrets, then reboot the website."
+                )
+            except Exception as exc:
+                st.error(str(exc))
+
+    st.divider()
     st.markdown("### Google Sheets")
     st.write(
         "Live inventory and plus/minus history sync here after every stock change. "
