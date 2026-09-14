@@ -21,7 +21,12 @@ from db import (
     _ensure_indexes,
     _ensure_karigar_column,
     normalize_database_url,
+    postgres_connect_args,
 )
+
+ROOT = Path(__file__).resolve().parent
+DEFAULT_SQLITE = ROOT / "dg_inventory.db"
+
 
 def save_database_url_secret(url: str) -> Path:
     """Write DATABASE_URL into local .streamlit/secrets.toml without dropping other keys."""
@@ -44,11 +49,13 @@ def _sqlite_engine() -> Engine:
 
 
 def _pg_engine(url: str) -> Engine:
+    extra = postgres_connect_args(normalize_database_url(url))
     engine = create_engine(
         normalize_database_url(url),
         future=True,
         pool_pre_ping=True,
         pool_recycle=280,
+        connect_args=extra or {},
     )
     Base.metadata.create_all(engine)
     _ensure_indexes(engine)

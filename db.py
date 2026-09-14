@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import os
+import re
+import socket
+import subprocess
 from datetime import datetime
 from functools import lru_cache
 from typing import Optional
+from urllib.parse import urlparse
 
 from sqlalchemy import (
     DateTime,
@@ -56,6 +60,39 @@ def running_on_streamlit_cloud() -> bool:
     return os.path.isdir("/mount/src") or os.environ.get("STREAMLIT_CLOUD") == "1"
 
 
+def _lookup_ipv4(host: str) -> Optional[str]:
+    try:
+        out = subprocess.check_output(
+            ["nslookup", host, "8.8.8.8"],
+            text=True,
+            timeout=12,
+            stderr=subprocess.STDOUT,
+        )
+    except Exception:
+        return None
+    addrs = [a for a in re.findall(r"Address:\s*(\d+\.\d+\.\d+\.\d+)", out) if a != "8.8.8.8"]
+    if not addrs:
+        addrs = [a for a in re.findall(r"(?m)^\s*(\d+\.\d+\.\d+\.\d+)\s*$", out) if a != "8.8.8.8"]
+    return addrs[-1] if addrs else None
+
+
+def postgres_connect_args(url: str) -> dict:
+    """If office DNS blocks neon.tech, still connect using Google DNS + hostaddr."""
+    parsed = urlparse(url.replace("postgresql+psycopg2://", "postgresql://", 1))
+    host = parsed.hostname
+    if not host:
+        return {}
+    try:
+        socket.getaddrinfo(host, parsed.port or 5432)
+        return {}
+    except OSError:
+        pass
+    ip = _lookup_ipv4(host)
+    if not ip:
+        return {}
+    return {"hostaddr": ip}
+
+
 def using_sqlite() -> bool:
     return _database_url().startswith("sqlite")
 
@@ -67,6 +104,9 @@ def _make_engine() -> Engine:
         kwargs["connect_args"] = {"check_same_thread": False}
     else:
         kwargs["pool_recycle"] = 280
+        extra = postgres_connect_args(url)
+        if extra:
+            kwargs["connect_args"] = extra
     engine = create_engine(url, **kwargs)
 
     if engine.dialect.name == "sqlite":
