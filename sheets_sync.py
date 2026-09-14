@@ -25,7 +25,11 @@ HISTORY_HEADERS = [
     "PO No",
     "Style",
     "Designer",
+    "Karigar",
 ]
+
+# Public spreadsheet ID for DG Inventory (not a secret). Cloud still needs the JSON key.
+DEFAULT_SPREADSHEET_ID = "1rG0gTby3J0HW8lGESyZOQIH4A5CH3wLvVxj6P0l8hhM"
 
 
 def _secrets() -> dict:
@@ -96,6 +100,7 @@ def sheets_config() -> dict[str, Any]:
         or gs.get("spreadsheet_id")
         or sec.get("GOOGLE_SHEET_ID")
         or local.get("spreadsheet_id")
+        or DEFAULT_SPREADSHEET_ID
         or ""
     )
     inventory_ws = gs.get("inventory_worksheet") or local.get("inventory_worksheet") or "Inventory"
@@ -261,18 +266,53 @@ def append_movements(rows: list[dict[str, Any]]) -> None:
                 r.get("po_no", ""),
                 r.get("style", ""),
                 r.get("designer_name", ""),
+                r.get("karigar_name", ""),
             ]
         )
     ws.append_rows(payload, value_input_option="USER_ENTERED")
 
 
+def _movement_row(r: dict[str, Any]) -> list:
+    return [
+        r.get("timestamp", ""),
+        r.get("type", ""),
+        r.get("item_id", ""),
+        r.get("material", ""),
+        r.get("qty_change", ""),
+        r.get("stock_after", ""),
+        r.get("note", ""),
+        r.get("po_no", ""),
+        r.get("style", ""),
+        r.get("designer_name", ""),
+        r.get("karigar_name", ""),
+    ]
+
+
+def rebuild_stock_movements(rows: list[dict[str, Any]]) -> int:
+    sh, cfg = _open_spreadsheet()
+    ws = _ws(sh, cfg["history_worksheet"], HISTORY_HEADERS)
+    ws.clear()
+    ws.update(range_name="A1", values=[HISTORY_HEADERS], value_input_option="USER_ENTERED")
+    payload = [_movement_row(r) for r in rows]
+    for i in range(0, len(payload), 2000):
+        ws.append_rows(payload[i : i + 2000], value_input_option="USER_ENTERED")
+    return len(payload)
+
+
 def sync_after_change(inventory_df: pd.DataFrame, movement_rows: list[dict[str, Any]], last_updated: str) -> str:
-    """Rewrite Inventory sheet and append movement history. Returns a status message."""
+    """Append Stock Movements, then refresh the Inventory tab."""
     if not is_configured():
         return "Google Sheets is not configured — skipped."
+    notes = []
+    try:
+        append_movements(movement_rows)
+        if movement_rows:
+            notes.append("Stock Movements")
+    except Exception as exc:
+        raise RuntimeError("Stock Movements sync failed: " + _explain_sheets_error(exc)) from exc
     try:
         sync_inventory(inventory_df, last_updated)
-        append_movements(movement_rows)
+        notes.append("Inventory")
     except Exception as exc:
-        raise RuntimeError(_explain_sheets_error(exc)) from exc
-    return "Google Sheets updated (Inventory + Stock Movements)."
+        notes.append("Inventory snapshot failed: " + _explain_sheets_error(exc))
+    return "Google Sheets updated (" + ", ".join(notes) + ")."

@@ -37,6 +37,7 @@ import sheets_sync
 
 importlib.reload(sheets_sync)
 from sheets_sync import (
+    rebuild_stock_movements,
     save_local_settings,
     save_service_account_json,
     sheets_config,
@@ -870,6 +871,18 @@ with tabs[7]:
                 st.warning(
                     f"Share the Google Sheet with **{email}** as Editor, then try Save and test again."
                 )
+
+    if st.button("Rebuild Stock Movements sheet from database"):
+        try:
+            with session_scope(False) as session:
+                txns = history_transactions(session, limit=50000)
+                moves = []
+                for t in reversed(txns):
+                    moves.extend(movement_payload(t, session))
+            n = rebuild_stock_movements(moves)
+            st.success(f"Wrote {n:,} rows to the Stock Movements tab.")
+        except Exception as exc:
+            st.error(str(exc))
 
     st.divider()
     st.markdown("### Upload BOM")

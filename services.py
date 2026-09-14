@@ -701,6 +701,7 @@ def movement_payload(txn: Transaction, session: Session | None = None) -> list[d
                 "po_no": txn.po_no or "",
                 "style": txn.style or "",
                 "designer_name": txn.designer_name or "",
+                "karigar_name": getattr(txn, "karigar_name", None) or "",
             }
         )
     return out
