@@ -16,7 +16,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session, selectinload
 
 from config import normalize_karigar
-from db import BOM, Counter, Inventory, Transaction, TransactionLine, dialect_name
+from db import BOM, Counter, DeductionError, Inventory, Transaction, TransactionLine, dialect_name
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -823,6 +823,92 @@ def consumption_rows(session: Session) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def log_deduction_errors(session: Session, entries: list[dict]) -> int:
+    """Save lines that were not deducted, such as a style missing from the BOM."""
+    saved = 0
+    for rec in entries:
+        message = str(rec.get("message") or "").strip()
+        if not message:
+            continue
+        raw_qty = rec.get("qty")
+        qty = None
+        if raw_qty is not None and not (isinstance(raw_qty, float) and pd.isna(raw_qty)):
+            try:
+                qty = float(raw_qty)
+            except (TypeError, ValueError):
+                qty = None
+        session.add(
+            DeductionError(
+                timestamp=now_ist(),
+                source=str(rec.get("source") or "PO")[:32],
+                po_no=(str(rec.get("po_no")).strip() or None) if rec.get("po_no") else None,
+                style=(str(rec.get("style")).strip() or None) if rec.get("style") else None,
+                qty=qty,
+                karigar_name=(str(rec.get("karigar_name")).strip() or None) if rec.get("karigar_name") else None,
+                designer_name=(str(rec.get("designer_name")).strip() or None) if rec.get("designer_name") else None,
+                material=(str(rec.get("material")).strip() or None) if rec.get("material") else None,
+                message=message[:1024],
+                resolved=False,
+            )
+        )
+        saved += 1
+    session.flush()
+    return saved
+
+
+def list_deduction_errors(session: Session, include_resolved: bool = False, limit: int = 500) -> list[dict]:
+    q = select(DeductionError).order_by(DeductionError.timestamp.desc(), DeductionError.id.desc())
+    if not include_resolved:
+        q = q.where(DeductionError.resolved.is_(False))
+    rows = session.execute(q.limit(limit)).scalars()
+    out = []
+    for row in rows:
+        out.append(
+            {
+                "id": int(row.id),
+                "when": row.timestamp.strftime("%Y-%m-%d %H:%M") if row.timestamp else "",
+                "source": row.source,
+                "po_no": row.po_no or "",
+                "style": row.style or "",
+                "qty": row.qty,
+                "karigar_name": row.karigar_name or "",
+                "designer_name": row.designer_name or "",
+                "material": row.material or "",
+                "message": row.message,
+                "resolved": bool(row.resolved),
+            }
+        )
+    return out
+
+
+def count_open_deduction_errors(session: Session) -> int:
+    return int(
+        session.scalar(
+            select(func.count()).select_from(DeductionError).where(DeductionError.resolved.is_(False))
+        )
+        or 0
+    )
+
+
+def resolve_deduction_errors(session: Session, error_ids: list[int]) -> int:
+    ids = []
+    for raw in error_ids:
+        try:
+            ids.append(int(raw))
+        except (TypeError, ValueError):
+            continue
+    if not ids:
+        return 0
+    rows = session.execute(select(DeductionError).where(DeductionError.id.in_(ids))).scalars()
+    n = 0
+    for row in rows:
+        if not row.resolved:
+            row.resolved = True
+            n += 1
+    session.flush()
+    return n
 
 
 def history_transactions(session: Session, limit: int = 500) -> list[Transaction]:

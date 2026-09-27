@@ -12,6 +12,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Float,
     ForeignKey,
@@ -190,6 +191,24 @@ class Transaction(Base):
     lines: Mapped[list["TransactionLine"]] = relationship(
         back_populates="transaction", cascade="all, delete-orphan"
     )
+
+
+class DeductionError(Base):
+    """A PO or designer line that was not deducted."""
+
+    __tablename__ = "deduction_errors"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    po_no: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    style: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    qty: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    karigar_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    designer_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    material: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    message: Mapped[str] = mapped_column(String(1024), nullable=False)
+    resolved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 class TransactionLine(Base):

@@ -19,8 +19,11 @@ from services import (
     bom_dataframe,
     bom_stats,
     consumption_rows,
+    count_open_deduction_errors,
     history_transactions,
     import_bom,
+    list_deduction_errors,
+    log_deduction_errors,
     import_inventory,
     inventory_dataframe,
     itemwise_consumption,
@@ -29,6 +32,7 @@ from services import (
     movement_payload,
     now_ist,
     preview_po_lines,
+    resolve_deduction_errors,
     reverse_adjustment,
     reverse_transactions,
     reversed_adjustment_ids,
@@ -216,6 +220,23 @@ def _po_frame_from_editor(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _save_deduction_errors(entries: list[dict]) -> str | None:
+    if not entries:
+        return None
+    session = SessionLocal()
+    try:
+        n = log_deduction_errors(session, entries)
+        session.commit()
+    except Exception as exc:
+        session.rollback()
+        return f"Could not save the error list: {exc}"
+    finally:
+        session.close()
+    if n:
+        return f"Saved {n} missed deduction(s) on the Errors tab."
+    return None
+
+
 def _render_inventory_editor(prefix: str) -> None:
     flash = st.session_state.pop(f"{prefix}_inv_flash", None)
     if flash:
@@ -282,8 +303,10 @@ with st.sidebar:
     st.header("Status")
     with session_scope(False) as session:
         n_styles, n_bom = bom_stats(session)
+        n_errors = count_open_deduction_errors(session)
     st.metric("Distinct styles", f"{n_styles:,}")
     st.metric("BOM rows", f"{n_bom:,}")
+    st.metric("Missed deductions", f"{n_errors:,}")
     st.write(f"Database: `{dialect_name()}`")
     if dialect_name() == "sqlite" and running_on_streamlit_cloud():
         st.error(
@@ -318,6 +341,7 @@ tabs = st.tabs(
         "Adjustments",
         "Consumption",
         "History",
+        "Errors",
         "Export",
         "Setup / Import",
     ]
@@ -486,9 +510,24 @@ with tabs[0]:
                 session.close()
         st.success(f"Applied {len(succeeded)} PO line(s).")
         if failed:
-            st.error("Skipped / failed:")
+            st.error("Skipped / failed. These were not deducted:")
             for p, reason in failed:
                 st.write(f"- {p.po_no} {p.style} qty {p.qty}: {reason}")
+            save_msg = _save_deduction_errors(
+                [
+                    {
+                        "source": "PO",
+                        "po_no": p.po_no,
+                        "style": p.style,
+                        "qty": p.qty,
+                        "karigar_name": p.karigar_name,
+                        "message": reason,
+                    }
+                    for p, reason in failed
+                ]
+            )
+            if save_msg:
+                st.info(save_msg)
         if txns:
             msg = _push_sheets(txns)
             if msg:
@@ -586,6 +625,18 @@ with tabs[1]:
         except Exception as exc:
             session.rollback()
             st.error(str(exc))
+            save_msg = _save_deduction_errors(
+                [
+                    {
+                        "source": "DESIGNER",
+                        "designer_name": designer,
+                        "material": ", ".join(mat for mat, _qty in lines),
+                        "message": str(exc),
+                    }
+                ]
+            )
+            if save_msg:
+                st.info(save_msg)
         finally:
             session.close()
 
@@ -951,9 +1002,73 @@ with tabs[5]:
 
 
 # ---------------------------------------------------------------------------
-# Export
+# Errors
 # ---------------------------------------------------------------------------
 with tabs[6]:
+    st.subheader("Errors")
+    st.write(
+        "Lines that were not deducted are saved here. "
+        "A style that is not on the BOM, and has no other colour of the same style, is one of these."
+    )
+    show_done = st.checkbox("Show rows already marked done", key="err_show_done")
+    with session_scope(False) as session:
+        err_rows = list_deduction_errors(session, include_resolved=show_done)
+    if not err_rows:
+        st.info("No missed deductions.")
+    else:
+        open_ids = [int(rec["id"]) for rec in err_rows if not rec["resolved"]]
+        b1, b2 = st.columns(2)
+        mark_done = b1.button("Mark ticked as done", type="primary", key="err_mark_done")
+        if b2.button("Tick all open", key="err_tick_all"):
+            for err_id in open_ids:
+                st.session_state[f"err_tick_{err_id}"] = True
+            st.rerun()
+        if mark_done:
+            chosen = [err_id for err_id in open_ids if st.session_state.get(f"err_tick_{err_id}")]
+            if not chosen:
+                st.error("Tick at least one error, then mark it done.")
+            else:
+                session = SessionLocal()
+                try:
+                    n = resolve_deduction_errors(session, chosen)
+                    session.commit()
+                    for err_id in chosen:
+                        st.session_state.pop(f"err_tick_{err_id}", None)
+                    st.success(f"Marked {n} error(s) done.")
+                    st.rerun()
+                except Exception as exc:
+                    session.rollback()
+                    st.error(str(exc))
+                finally:
+                    session.close()
+        for rec in err_rows:
+            left, right = st.columns([1, 5])
+            if rec["resolved"]:
+                left.caption("Done")
+            else:
+                left.checkbox("Tick", key=f"err_tick_{int(rec['id'])}")
+            qty = ""
+            if rec["qty"] is not None:
+                qty = f" · Qty {rec['qty']:g}"
+            bits = [f"#{rec['id']}", rec["when"], rec["source"]]
+            if rec["po_no"]:
+                bits.append(f"PO {rec['po_no']}")
+            if rec["style"]:
+                bits.append(f"Style {rec['style']}")
+            if rec["designer_name"]:
+                bits.append(rec["designer_name"])
+            if rec["karigar_name"]:
+                bits.append(f"Karigar {rec['karigar_name']}")
+            if rec["material"]:
+                bits.append(rec["material"])
+            right.write(" · ".join(bits) + qty)
+            right.caption(rec["message"])
+
+
+# ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
+with tabs[7]:
     st.subheader("Export Excel")
     st.write("One workbook with BOM, Inventory, Transactions, Consumption Summary, and Item-wise Consumption.")
     if st.button("Build Excel file", type="primary"):
@@ -992,7 +1107,7 @@ with tabs[6]:
 # ---------------------------------------------------------------------------
 # Setup / Import
 # ---------------------------------------------------------------------------
-with tabs[7]:
+with tabs[8]:
     st.subheader("Setup / Import")
     with session_scope(False) as session:
         n_styles, n_bom = bom_stats(session)
