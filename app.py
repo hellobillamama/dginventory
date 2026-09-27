@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import time
 from contextlib import contextmanager
 
 import pandas as pd
@@ -28,6 +29,8 @@ from services import (
     movement_payload,
     now_ist,
     preview_po_lines,
+    reverse_adjustment,
+    reversed_adjustment_ids,
     set_inventory_item,
     transaction_lines_flat,
     _as_text,
@@ -526,39 +529,92 @@ with tabs[3]:
         adj_note = st.text_input("Note (optional)", key="adj_note")
         if st.button("Apply adjustment", type="primary"):
             target = (new_material or "").strip() or (material or "")
-            session = SessionLocal()
-            try:
-                txn = apply_adjustment(
-                    session,
-                    material=target,
-                    qty=float(qty),
-                    direction="PLUS" if direction == "Plus" else "MINUS",
-                    note=adj_note,
-                    unit=unit,
+            fingerprint = f"{target}|{direction}|{float(qty):g}|{(adj_note or '').strip()}"
+            last_adj = st.session_state.get("last_adj") or {}
+            just_applied = (
+                last_adj.get("fp") == fingerprint
+                and (time.time() - float(last_adj.get("at") or 0)) < 30
+            )
+            if just_applied:
+                st.warning(
+                    "That same plus/minus was just applied. "
+                    "It was not applied again. Use Undo on the extra line if stock was reduced twice."
                 )
-                session.commit()
-                st.success(f"{direction} {qty:g} on {target}")
-                msg = _push_sheets([txn])
-                if msg:
-                    st.info(msg)
-            except Exception as exc:
-                session.rollback()
-                st.error(str(exc))
-            finally:
-                session.close()
+            else:
+                session = SessionLocal()
+                try:
+                    txn = apply_adjustment(
+                        session,
+                        material=target,
+                        qty=float(qty),
+                        direction="PLUS" if direction == "Plus" else "MINUS",
+                        note=adj_note,
+                        unit=unit,
+                    )
+                    session.commit()
+                    st.session_state["last_adj"] = {"fp": fingerprint, "at": time.time()}
+                    with session_scope(False) as check:
+                        rows = [r for r in list_inventory(check) if r.material == target]
+                    if rows:
+                        st.success(f"{direction} {qty:g} on {target}. Stock is now {rows[0].stock_qty:g}.")
+                    else:
+                        st.success(f"{direction} {qty:g} on {target}.")
+                    msg = _push_sheets([txn])
+                    if msg:
+                        st.info(msg)
+                except Exception as exc:
+                    session.rollback()
+                    st.error(str(exc))
+                finally:
+                    session.close()
 
     with col_b:
         st.markdown("**Recent plus / minus history**")
+        st.caption("If the same minus was applied twice, press Undo on the extra line. That puts the quantity back.")
         with session_scope(False) as session:
+            undone = reversed_adjustment_ids(session)
             hist = [
                 t
                 for t in history_transactions(session, limit=200)
                 if t.txn_type in ("ADJUST_PLUS", "ADJUST_MINUS")
             ]
-            for t in hist[:50]:
-                sign = "+" if t.txn_type == "ADJUST_PLUS" else "−"
-                mats = ", ".join(f"{ln.material} {sign}{ln.qty_deducted:g}" for ln in t.lines)
-                st.write(f"{t.timestamp.strftime('%d/%m/%Y %H:%M')} · {mats} · {t.note or ''}")
+            hist_view = [
+                (
+                    t.id,
+                    t.timestamp,
+                    t.txn_type,
+                    t.note or "",
+                    [(ln.material, float(ln.qty_deducted)) for ln in t.lines],
+                    t.id in undone,
+                )
+                for t in hist[:30]
+            ]
+        for txn_id, ts, txn_type, note, lines, already in hist_view:
+            sign = "+" if txn_type == "ADJUST_PLUS" else "−"
+            mats = ", ".join(f"{name} {sign}{qty:g}" for name, qty in lines)
+            label = f"{ts.strftime('%d/%m/%Y %H:%M')} · {mats}"
+            if note:
+                label = f"{label} · {note}"
+            row_l, row_r = st.columns([5, 1])
+            row_l.write(label)
+            if already:
+                row_r.caption("Undone")
+            elif row_r.button("Undo", key=f"undo_adj_{txn_id}"):
+                session = SessionLocal()
+                try:
+                    txn = reverse_adjustment(session, txn_id)
+                    session.commit()
+                    st.session_state.pop("last_adj", None)
+                    st.success(f"Undid adjustment #{txn_id}.")
+                    msg = _push_sheets([txn])
+                    if msg:
+                        st.info(msg)
+                    st.rerun()
+                except Exception as exc:
+                    session.rollback()
+                    st.error(str(exc))
+                finally:
+                    session.close()
 
     st.markdown("#### Upload plus / minus Excel")
     adj_upload = _excel_load_controls(

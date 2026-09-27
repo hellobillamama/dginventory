@@ -349,6 +349,89 @@ def apply_adjustment(
     return txn
 
 
+UNDO_NOTE_PREFIX = "Undo of adjustment #"
+
+
+def _undo_target_id(note: str | None) -> int | None:
+    text = (note or "").strip()
+    if not text.startswith(UNDO_NOTE_PREFIX):
+        return None
+    rest = text[len(UNDO_NOTE_PREFIX) :].strip()
+    digits = []
+    for ch in rest:
+        if ch.isdigit():
+            digits.append(ch)
+        else:
+            break
+    if not digits:
+        return None
+    return int("".join(digits))
+
+
+def reversed_adjustment_ids(session: Session) -> set[int]:
+    notes = session.execute(
+        select(Transaction.note).where(Transaction.note.like(f"{UNDO_NOTE_PREFIX}%"))
+    ).scalars()
+    found: set[int] = set()
+    for note in notes:
+        txn_id = _undo_target_id(note)
+        if txn_id is not None:
+            found.add(txn_id)
+    return found
+
+
+def reverse_adjustment(session: Session, txn_id: int) -> Transaction:
+    """Put stock back from one plus/minus. A second undo of the same row is refused."""
+    txn = session.get(Transaction, int(txn_id))
+    if txn is None:
+        raise ValueError("That adjustment was not found.")
+    if txn.txn_type not in (TXN_ADJUST_PLUS, TXN_ADJUST_MINUS):
+        raise ValueError("Only a plus or minus adjustment can be undone.")
+    if int(txn.id) in reversed_adjustment_ids(session):
+        raise ValueError("This adjustment was already undone.")
+    lines = list(txn.lines or [])
+    if not lines:
+        raise ValueError("That adjustment has no material line to undo.")
+
+    opposite = "PLUS" if txn.txn_type == TXN_ADJUST_MINUS else "MINUS"
+    materials = [ln.material for ln in lines]
+    inv = ensure_inventory_rows(session, materials)
+    for ln in lines:
+        qty = abs(float(ln.qty_deducted))
+        row = inv[ln.material]
+        if opposite == "PLUS":
+            row.stock_qty = float(row.stock_qty) + qty
+        else:
+            row.stock_qty = float(row.stock_qty) - qty
+
+    original = (txn.note or "").strip()
+    note = f"{UNDO_NOTE_PREFIX}{txn.id}"
+    if original:
+        note = f"{note} — {original}"
+
+    reversal = Transaction(
+        timestamp=now_ist(),
+        txn_type=TXN_ADJUST_PLUS if opposite == "PLUS" else TXN_ADJUST_MINUS,
+        style=None,
+        po_no=None,
+        qty=sum(abs(float(ln.qty_deducted)) for ln in lines),
+        designer_name=None,
+        note=note[:1024],
+    )
+    session.add(reversal)
+    session.flush()
+    for ln in lines:
+        session.add(
+            TransactionLine(
+                transaction_id=reversal.id,
+                material=ln.material,
+                qty_deducted=abs(float(ln.qty_deducted)),
+            )
+        )
+    session.flush()
+    return reversal
+
+
 def set_inventory_item(
     session: Session,
     material: str,
