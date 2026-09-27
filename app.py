@@ -224,17 +224,17 @@ def _render_inventory_editor(prefix: str) -> None:
     sig = (search or "").strip().lower()
     if st.session_state.get(f"{prefix}_inv_sig") != sig or f"{prefix}_inv_df" not in st.session_state:
         with session_scope(False) as session:
-            items = list_inventory(session, search)
-        st.session_state[f"{prefix}_inv_df"] = pd.DataFrame(
-            [
+            items = [
                 {
                     "item_id": r.item_id,
                     "material": r.material,
-                    "stock_qty": r.stock_qty,
+                    "stock_qty": float(r.stock_qty),
                     "unit": r.unit or "",
                 }
-                for r in items
-            ],
+                for r in list_inventory(session, search)
+            ]
+        st.session_state[f"{prefix}_inv_df"] = pd.DataFrame(
+            items,
             columns=["item_id", "material", "stock_qty", "unit"],
         )
         st.session_state[f"{prefix}_inv_sig"] = sig
