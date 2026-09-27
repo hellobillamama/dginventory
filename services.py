@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -114,6 +115,7 @@ class LinePreview:
     message: str = ""
     materials: list[MaterialPreview] = field(default_factory=list)
     karigar_name: Optional[str] = None
+    bom_style: Optional[str] = None
 
     @property
     def is_error(self) -> bool:
@@ -122,6 +124,50 @@ class LinePreview:
     @property
     def is_applicable(self) -> bool:
         return self.status in ("ok", "shortfall")
+
+
+_STYLE_CODE = re.compile(r"^([A-Za-z]+)(\d+)([A-Za-z]+)$")
+
+
+def split_style_code(style: str) -> Optional[tuple[str, str, str]]:
+    """Style is category + style number + colour, e.g. ID0086IVR → ID, 0086, IVR."""
+    match = _STYLE_CODE.match((style or "").strip())
+    if not match:
+        return None
+    return match.group(1).upper(), match.group(2), match.group(3).upper()
+
+
+def resolve_bom_style(requested: str, known_styles: list[str]) -> tuple[Optional[str], Optional[str]]:
+    """Pick the BOM style. Same category and style number can stand in for a missing colour."""
+    requested = (requested or "").strip()
+    if not requested or not known_styles:
+        return None, None
+    by_exact = {style: style for style in known_styles}
+    by_fold = {style.casefold(): style for style in known_styles}
+    exact = by_exact.get(requested) or by_fold.get(requested.casefold())
+    if exact is not None:
+        return exact, None
+
+    parts = split_style_code(requested)
+    if parts is None:
+        return None, None
+    category, style_no, colour = parts
+    siblings: list[str] = []
+    for style in known_styles:
+        other = split_style_code(style)
+        if other is None:
+            continue
+        if other[0] == category and other[1] == style_no and other[2] != colour:
+            siblings.append(style)
+    if not siblings:
+        return None, None
+    chosen = sorted(siblings, key=lambda style: style.casefold())[0]
+    chosen_colour = split_style_code(chosen)[2]
+    note = (
+        f"Colour {colour} is not on the BOM. "
+        f"Deducting the BOM of {chosen} (category {category}, style {style_no}, colour {chosen_colour})."
+    )
+    return chosen, note
 
 
 def preview_po_lines(session: Session, rows: list[dict]) -> list[LinePreview]:
@@ -158,10 +204,18 @@ def preview_po_lines(session: Session, rows: list[dict]) -> list[LinePreview]:
             continue
         parsed.append((i, po_no, style, qty, karigar_name))
 
-    styles = list({p[2] for p in parsed})
+    known_styles = list(session.execute(select(BOM.style).distinct()).scalars())
+    resolved: dict[str, tuple[Optional[str], Optional[str]]] = {}
+    fetch_styles: set[str] = set()
+    for _i, _po, style, _qty, _karigar in parsed:
+        bom_style, colour_note = resolve_bom_style(style, known_styles)
+        resolved[style] = (bom_style, colour_note)
+        if bom_style:
+            fetch_styles.add(bom_style)
+
     bom_by_style: dict[str, list[BOM]] = defaultdict(list)
-    if styles:
-        for bom in session.execute(select(BOM).where(BOM.style.in_(styles))).scalars():
+    if fetch_styles:
+        for bom in session.execute(select(BOM).where(BOM.style.in_(list(fetch_styles)))).scalars():
             bom_by_style[bom.style].append(bom)
 
     needed_materials = {b.material for items in bom_by_style.values() for b in items}
@@ -175,14 +229,15 @@ def preview_po_lines(session: Session, rows: list[dict]) -> list[LinePreview]:
         }
 
     for i, po_no, style, qty, karigar_name in parsed:
-        items = bom_by_style.get(style) or []
+        bom_style, colour_note = resolved.get(style, (None, None))
+        items = bom_by_style.get(bom_style or "") or []
         if not items:
             results[i] = LinePreview(
                 po_no=po_no,
                 style=style,
                 qty=qty,
                 status="style_not_found",
-                message="BOM has no entry for this style.",
+                message="BOM has no entry for this style, and no other colour of the same style.",
                 karigar_name=karigar_name,
             )
             continue
@@ -202,14 +257,19 @@ def preview_po_lines(session: Session, rows: list[dict]) -> list[LinePreview]:
                     shortfall=shortfall,
                 )
             )
+        message = colour_note or "OK"
+        if any_short:
+            extra = "Shortfall — stock may go negative."
+            message = f"{message} {extra}" if colour_note else extra
         results[i] = LinePreview(
             po_no=po_no,
             style=style,
             qty=qty,
             status="shortfall" if any_short else "ok",
-            message="Shortfall — stock may go negative." if any_short else "OK",
+            message=message,
             materials=mats,
             karigar_name=karigar_name,
+            bom_style=bom_style,
         )
 
     return [r for r in results if r is not None]
@@ -231,7 +291,11 @@ def apply_po_line(session: Session, preview: LinePreview) -> Transaction:
         qty=preview.qty,
         designer_name=None,
         karigar_name=preview.karigar_name,
-        note=None,
+        note=(
+            f"BOM taken from {preview.bom_style}"
+            if preview.bom_style and preview.bom_style.casefold() != (preview.style or "").casefold()
+            else None
+        ),
     )
     session.add(txn)
     session.flush()

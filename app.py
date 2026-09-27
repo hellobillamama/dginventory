@@ -331,8 +331,9 @@ with tabs[0]:
     st.subheader("PO Deduction")
     st.write(
         "Enter rows, paste from Excel, or upload a file. Columns: **PO No.**, **Style**, **Qty**, optional **Karigar**. "
-        "Preview every line, then confirm. Shortfalls warn but still deduct (stock can go negative). "
-        "Unknown styles are skipped. Karigar is optional."
+        "Style is category + style number + colour, for example **ID0086IVR** (ID, 0086, IVR). "
+        "If that colour is not on the BOM but the same style is (for example ID0086 in pink), that colour's BOM is deducted. "
+        "Preview every line, then confirm. Shortfalls warn but still deduct (stock can go negative)."
     )
     if "po_grid" not in st.session_state or st.session_state.po_grid is None:
         st.session_state.po_grid = _blank_po_grid()
@@ -441,6 +442,8 @@ with tabs[0]:
             label = f"{i}. {p.po_no} / {p.style} / qty {p.qty:g} — {p.status.upper()}"
             if p.karigar_name:
                 label += f" · Karigar: {p.karigar_name}"
+            if p.bom_style and p.bom_style.casefold() != p.style.casefold():
+                label += f" — {p.message}"
             if p.status == "ok":
                 st.success(label)
             elif p.status == "shortfall":
@@ -832,7 +835,7 @@ with tabs[5]:
     if hist_flash:
         st.success(hist_flash)
     st.write(
-        "Tick every row you want to cancel, then press **Undo selected**. "
+        "Tick the rows you want to cancel, then press **Undo selected**. "
         "Stock goes back for those lines in one step. A row already undone is skipped."
     )
     hist_upload = _excel_load_controls(
@@ -899,27 +902,19 @@ with tabs[5]:
     if not hist_records:
         st.info("No transactions yet.")
     else:
-        hist_df = pd.DataFrame(hist_records)
-        edited_hist = st.data_editor(
-            hist_df,
-            hide_index=True,
-            use_container_width=True,
-            disabled=["id", "when", "summary", "lines", "status"],
-            column_config={
-                "select": st.column_config.CheckboxColumn("Select"),
-                "id": st.column_config.NumberColumn("ID", format="%d"),
-                "when": st.column_config.TextColumn("When"),
-                "summary": st.column_config.TextColumn("Transaction"),
-                "lines": st.column_config.TextColumn("Materials"),
-                "status": st.column_config.TextColumn("Status"),
-            },
-            key="history_select_editor",
-        )
-        if st.button("Undo selected", type="primary"):
-            chosen = []
-            for rec in edited_hist.to_dict(orient="records"):
-                if rec.get("select"):
-                    chosen.append(int(rec["id"]))
+        open_ids = [int(rec["id"]) for rec in hist_records if rec["status"] != "Undone"]
+        b1, b2, b3 = st.columns(3)
+        if b1.button("Tick all", key="hist_tick_all"):
+            for txn_id in open_ids:
+                st.session_state[f"hist_tick_{txn_id}"] = True
+            st.rerun()
+        if b2.button("Clear ticks", key="hist_clear_ticks"):
+            for txn_id in open_ids:
+                st.session_state[f"hist_tick_{txn_id}"] = False
+            st.rerun()
+        undo_clicked = b3.button("Undo selected", type="primary", key="hist_undo_selected")
+        if undo_clicked:
+            chosen = [txn_id for txn_id in open_ids if st.session_state.get(f"hist_tick_{txn_id}")]
             if not chosen:
                 st.error("Tick at least one row, then press Undo selected.")
             else:
@@ -934,6 +929,8 @@ with tabs[5]:
                 finally:
                     session.close()
                 if reversals is not None:
+                    for txn_id in chosen:
+                        st.session_state.pop(f"hist_tick_{txn_id}", None)
                     msg = _push_sheets(reversals)
                     text = f"Undid {len(reversals)} transaction(s)."
                     if skipped:
@@ -942,6 +939,15 @@ with tabs[5]:
                         text += " " + msg
                     st.session_state.history_flash = text
                     st.rerun()
+        for rec in hist_records:
+            left, right = st.columns([1, 5])
+            if rec["status"] == "Undone":
+                left.caption("Undone")
+            else:
+                left.checkbox("Tick", key=f"hist_tick_{int(rec['id'])}")
+            right.write(f"#{rec['id']} · {rec['when']} · {rec['summary']}")
+            if rec["lines"]:
+                right.caption(rec["lines"])
 
 
 # ---------------------------------------------------------------------------
