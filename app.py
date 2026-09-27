@@ -30,7 +30,10 @@ from services import (
     now_ist,
     preview_po_lines,
     reverse_adjustment,
+    reverse_transactions,
     reversed_adjustment_ids,
+    reversed_transaction_ids,
+    save_inventory_edits,
     set_inventory_item,
     transaction_lines_flat,
     _as_text,
@@ -172,6 +175,104 @@ def _excel_load_controls(label: str, key: str, columns: list[str], sample: dict 
     return uploaded
 
 
+def _blank_po_grid() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "po_no": pd.Series([""], dtype="string"),
+            "style": pd.Series([""], dtype="string"),
+            "qty": pd.Series([pd.NA], dtype="Float64"),
+            "karigar": pd.Series([KARIGAR_NONE], dtype="string"),
+        }
+    )
+
+
+def _po_frame_from_editor(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep rows the user actually filled. Drop the empty starter row."""
+    kept = []
+    if df is None or df.empty:
+        return _blank_po_grid().iloc[0:0]
+    for rec in df.to_dict(orient="records"):
+        po_no = _as_text(rec.get("po_no"))
+        style = _as_text(rec.get("style"))
+        raw_qty = rec.get("qty")
+        try:
+            if raw_qty is None or (isinstance(raw_qty, float) and pd.isna(raw_qty)) or str(raw_qty).strip() == "":
+                qty = None
+            else:
+                qty = float(raw_qty)
+        except (TypeError, ValueError):
+            qty = None
+        if not po_no and not style and not qty:
+            continue
+        karigar = _as_text(rec.get("karigar")) or KARIGAR_NONE
+        kept.append({"po_no": po_no, "style": style, "qty": qty, "karigar": karigar})
+    out = pd.DataFrame(kept, columns=["po_no", "style", "qty", "karigar"])
+    if out.empty:
+        return out
+    out["po_no"] = out["po_no"].astype("string")
+    out["style"] = out["style"].astype("string")
+    out["karigar"] = out["karigar"].astype("string")
+    out["qty"] = pd.to_numeric(out["qty"], errors="coerce")
+    return out
+
+
+def _render_inventory_editor(prefix: str) -> None:
+    flash = st.session_state.pop(f"{prefix}_inv_flash", None)
+    if flash:
+        st.success(flash)
+    search = st.text_input("Search material name", key=f"{prefix}_inv_search")
+    sig = (search or "").strip().lower()
+    if st.session_state.get(f"{prefix}_inv_sig") != sig or f"{prefix}_inv_df" not in st.session_state:
+        with session_scope(False) as session:
+            items = list_inventory(session, search)
+        st.session_state[f"{prefix}_inv_df"] = pd.DataFrame(
+            [
+                {
+                    "item_id": r.item_id,
+                    "material": r.material,
+                    "stock_qty": r.stock_qty,
+                    "unit": r.unit or "",
+                }
+                for r in items
+            ],
+            columns=["item_id", "material", "stock_qty", "unit"],
+        )
+        st.session_state[f"{prefix}_inv_sig"] = sig
+        st.session_state[f"{prefix}_inv_nonce"] = int(st.session_state.get(f"{prefix}_inv_nonce", 0)) + 1
+    st.caption(
+        "Change stock, unit, or the material name, or add a row. Then Save. "
+        "This works while you are on PO Deduction, Designer Take, or Inventory. Save before you change the search."
+    )
+    edited = st.data_editor(
+        st.session_state[f"{prefix}_inv_df"],
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "item_id": st.column_config.TextColumn("Item ID", disabled=True),
+            "material": st.column_config.TextColumn("Material"),
+            "stock_qty": st.column_config.NumberColumn("Stock", step=1.0, format="%g"),
+            "unit": st.column_config.TextColumn("Unit"),
+        },
+        key=f"{prefix}_inv_editor_{st.session_state.get(f'{prefix}_inv_nonce', 0)}",
+    )
+    if st.button("Save inventory changes", type="primary", key=f"{prefix}_inv_save"):
+        session = SessionLocal()
+        try:
+            txns = save_inventory_edits(session, edited.fillna("").to_dict(orient="records"))
+            session.commit()
+            st.session_state.pop(f"{prefix}_inv_df", None)
+            st.session_state.pop(f"{prefix}_inv_sig", None)
+            msg = _push_sheets(txns) if txns else _manual_full_sync()
+            st.session_state[f"{prefix}_inv_flash"] = ("Saved inventory. " + msg).strip()
+            st.rerun()
+        except Exception as exc:
+            session.rollback()
+            st.error(str(exc))
+        finally:
+            session.close()
+
+
 get_engine()
 
 st.title("DG Inventory")
@@ -233,14 +334,31 @@ with tabs[0]:
         "Preview every line, then confirm. Shortfalls warn but still deduct (stock can go negative). "
         "Unknown styles are skipped. Karigar is optional."
     )
-    if "po_grid" not in st.session_state:
-        st.session_state.po_grid = pd.DataFrame(
-            {"po_no": [""], "style": [""], "qty": [None], "karigar": [KARIGAR_NONE]}
-        )
+    if "po_grid" not in st.session_state or st.session_state.po_grid is None:
+        st.session_state.po_grid = _blank_po_grid()
     if "karigar" not in st.session_state.po_grid.columns:
         st.session_state.po_grid["karigar"] = KARIGAR_NONE
     if "po_editor_nonce" not in st.session_state:
         st.session_state.po_editor_nonce = 0
+
+    st.markdown("**Add one line**")
+    with st.form("po_add_line", clear_on_submit=True):
+        a1, a2, a3, a4 = st.columns([2, 2, 1, 2])
+        simple_po = a1.text_input("PO No.")
+        simple_style = a2.text_input("Style")
+        simple_qty = a3.number_input("Qty", min_value=0.0, step=1.0)
+        simple_karigar = a4.selectbox("Karigar", karigar_select_options())
+        add_line = st.form_submit_button("Add line")
+    if add_line:
+        if not str(simple_po).strip() or not str(simple_style).strip() or float(simple_qty) <= 0:
+            st.error("PO No., Style, and a Qty greater than 0 are required.")
+        else:
+            st.session_state.pending_po_line = {
+                "po_no": str(simple_po).strip(),
+                "style": str(simple_style).strip(),
+                "qty": float(simple_qty),
+                "karigar": simple_karigar or KARIGAR_NONE,
+            }
 
     po_upload = _excel_load_controls(
         "Upload PO list (.xlsx or .csv)",
@@ -278,16 +396,19 @@ with tabs[0]:
             "po_no": st.column_config.TextColumn("PO No.", required=False, width="medium"),
             "style": st.column_config.TextColumn("Style", required=False, width="medium"),
             "qty": st.column_config.NumberColumn("Qty", min_value=0.0, step=1.0, format="%g"),
-            "karigar": st.column_config.SelectboxColumn(
-                "Karigar Name",
-                options=karigar_select_options(),
-                default=KARIGAR_NONE,
-                required=False,
-            ),
+            "karigar": st.column_config.TextColumn("Karigar Name (optional)"),
         },
         key=f"po_editor_{st.session_state.po_editor_nonce}",
     )
-    st.session_state.po_grid = po_edited
+    if st.session_state.get("pending_po_line"):
+        extra = st.session_state.pop("pending_po_line")
+        merged = pd.concat(
+            [_po_frame_from_editor(po_edited), pd.DataFrame([extra])],
+            ignore_index=True,
+        )
+        st.session_state.po_grid = merged
+        st.session_state.po_editor_nonce += 1
+        st.rerun()
 
     c1, c2 = st.columns(2)
     preview_clicked = c1.button("Preview all lines", type="primary")
@@ -371,12 +492,17 @@ with tabs[0]:
                 st.info(msg)
         st.session_state.po_previews = None
 
+    with st.expander("Edit inventory now"):
+        _render_inventory_editor("po")
+
 
 # ---------------------------------------------------------------------------
 # Designer Take
 # ---------------------------------------------------------------------------
 with tabs[1]:
     st.subheader("Designer Take")
+    with st.expander("Edit inventory now"):
+        _render_inventory_editor("designer")
     if "pending_designer_name" in st.session_state:
         st.session_state.designer_name = st.session_state.pop("pending_designer_name")
     if "pending_designer_note" in st.session_state:
@@ -432,12 +558,13 @@ with tabs[1]:
         use_container_width=True,
         hide_index=True,
         column_config={
-            "material": st.column_config.SelectboxColumn("Material", options=mat_options or [""]),
+            "material": st.column_config.TextColumn("Material"),
             "qty": st.column_config.NumberColumn("Qty", min_value=0.0, step=1.0, format="%g"),
         },
         key=f"designer_editor_{st.session_state.designer_editor_nonce}",
     )
-    st.session_state.designer_grid = d_edited
+    if mat_options:
+        st.caption("Materials already in stock: " + ", ".join(mat_options[:12]) + ("…" if len(mat_options) > 12 else ""))
     if st.button("Confirm designer take", type="primary"):
         lines = []
         for rec in d_edited.to_dict(orient="records"):
@@ -465,22 +592,7 @@ with tabs[1]:
 # ---------------------------------------------------------------------------
 with tabs[2]:
     st.subheader("Live inventory")
-    search = st.text_input("Search material name", key="inv_search")
-    with session_scope(False) as session:
-        items = list_inventory(session, search)
-        df = pd.DataFrame(
-            [
-                {
-                    "item_id": r.item_id,
-                    "material": r.material,
-                    "stock_qty": r.stock_qty,
-                    "unit": r.unit,
-                }
-                for r in items
-            ]
-        )
-    st.dataframe(df, use_container_width=True, hide_index=True)
-    st.caption(f"{len(df):,} item(s)")
+    _render_inventory_editor("inv")
 
     st.markdown("#### Upload inventory Excel")
     inv_tab_file = _excel_load_controls(
@@ -517,6 +629,8 @@ with tabs[2]:
 with tabs[3]:
     st.subheader("Add / minus inventory")
     st.write("Plus increases stock. Minus decreases stock. Each confirm is logged and synced to Google Sheets.")
+    with st.expander("Edit inventory now (set the exact stock)"):
+        _render_inventory_editor("adjust")
     with session_scope(False) as session:
         materials = list_materials(session)
     col_a, col_b = st.columns(2)
@@ -714,6 +828,13 @@ with tabs[4]:
 # ---------------------------------------------------------------------------
 with tabs[5]:
     st.subheader("Transaction history")
+    hist_flash = st.session_state.pop("history_flash", None)
+    if hist_flash:
+        st.success(hist_flash)
+    st.write(
+        "Tick every row you want to cancel, then press **Undo selected**. "
+        "Stock goes back for those lines in one step. A row already undone is skipped."
+    )
     hist_upload = _excel_load_controls(
         "Filter history by PO / style / material Excel (.xlsx or .csv)",
         "hist_xlsx",
@@ -748,39 +869,79 @@ with tabs[5]:
                 elif filter_mats and mats & filter_mats:
                     kept.append(t)
             txns = kept
-        if not txns:
-            st.info("No transactions yet.")
+        undone_ids = reversed_transaction_ids(session)
+        hist_records = []
         for t in txns:
-            parts = [
-                f"#{t.id}",
-                t.timestamp.strftime("%Y-%m-%d %H:%M"),
-            ]
-            if t.txn_type == "PO":
-                parts.append(f"PO {t.po_no}" if t.po_no else "PO")
-                if t.style:
-                    parts.append(f"Style {t.style}")
-                if t.qty is not None:
-                    parts.append(f"Qty {t.qty:g}")
-                if t.karigar_name:
-                    parts.append(f"Karigar: {t.karigar_name}")
+            parts = [t.txn_type]
+            if t.po_no:
+                parts.append(f"PO {t.po_no}")
+            if t.style:
+                parts.append(f"Style {t.style}")
+            if t.qty is not None:
+                parts.append(f"Qty {t.qty:g}")
+            if t.designer_name:
+                parts.append(t.designer_name)
+            if t.karigar_name:
+                parts.append(f"Karigar {t.karigar_name}")
+            if t.note:
+                parts.append(t.note)
+            line_txt = ", ".join(f"{ln.material} {ln.qty_deducted:g}" for ln in t.lines)
+            hist_records.append(
+                {
+                    "select": False,
+                    "id": int(t.id),
+                    "when": t.timestamp.strftime("%Y-%m-%d %H:%M"),
+                    "summary": " | ".join(parts),
+                    "lines": line_txt,
+                    "status": "Undone" if t.id in undone_ids else "",
+                }
+            )
+    if not hist_records:
+        st.info("No transactions yet.")
+    else:
+        hist_df = pd.DataFrame(hist_records)
+        edited_hist = st.data_editor(
+            hist_df,
+            hide_index=True,
+            use_container_width=True,
+            disabled=["id", "when", "summary", "lines", "status"],
+            column_config={
+                "select": st.column_config.CheckboxColumn("Select"),
+                "id": st.column_config.NumberColumn("ID", format="%d"),
+                "when": st.column_config.TextColumn("When"),
+                "summary": st.column_config.TextColumn("Transaction"),
+                "lines": st.column_config.TextColumn("Materials"),
+                "status": st.column_config.TextColumn("Status"),
+            },
+            key="history_select_editor",
+        )
+        if st.button("Undo selected", type="primary"):
+            chosen = []
+            for rec in edited_hist.to_dict(orient="records"):
+                if rec.get("select"):
+                    chosen.append(int(rec["id"]))
+            if not chosen:
+                st.error("Tick at least one row, then press Undo selected.")
             else:
-                parts.append(t.txn_type)
-                if t.po_no:
-                    parts.append(f"PO {t.po_no}")
-                if t.style:
-                    parts.append(t.style)
-                if t.qty is not None:
-                    parts.append(f"qty {t.qty:g}")
-                if t.designer_name:
-                    parts.append(t.designer_name)
-            title = " | ".join(parts)
-            with st.expander(title):
-                if t.note:
-                    st.write(t.note)
-                lines = pd.DataFrame(
-                    [{"material": ln.material, "qty_deducted": ln.qty_deducted} for ln in t.lines]
-                )
-                st.dataframe(lines, use_container_width=True, hide_index=True)
+                session = SessionLocal()
+                try:
+                    reversals, skipped = reverse_transactions(session, chosen)
+                    session.commit()
+                except Exception as exc:
+                    session.rollback()
+                    st.error(str(exc))
+                    reversals = None
+                finally:
+                    session.close()
+                if reversals is not None:
+                    msg = _push_sheets(reversals)
+                    text = f"Undid {len(reversals)} transaction(s)."
+                    if skipped:
+                        text += " Skipped: " + " ".join(skipped)
+                    if msg:
+                        text += " " + msg
+                    st.session_state.history_flash = text
+                    st.rerun()
 
 
 # ---------------------------------------------------------------------------
